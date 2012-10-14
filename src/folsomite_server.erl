@@ -66,12 +66,8 @@ handle_info(Info, State) ->
     unexpected(info, Info),
     {noreply, State}.
 
-terminate(shutdown, #state{timer_ref = Ref} = State) ->
-    erlang:cancel_timer(Ref),
-    Hostname = net_adm:localhost(),
-    Prefix = State#state.node_prefix,
-    Terminate = prepare_event(Hostname, Prefix, "heartbeat", 1, [terminate]),
-    zeta:sv_batch([Terminate]);
+terminate(shutdown, #state{timer_ref = Ref}) ->
+    erlang:cancel_timer(Ref);
 
 terminate(_, _) -> ok.
 
@@ -115,21 +111,11 @@ expand(X, NamePrefix) ->
 send_stats(State) ->
     Metrics = get_stats(),
     Timestamp = num2str(unixtime()),
-    Hostname = net_adm:localhost(),
-    Prefix = State#state.node_prefix,
-    Heartbeat = prepare_event(Hostname, Prefix, "heartbeat", 1, []),
-    Events =
-        [Heartbeat|[prepare_event(Hostname, Prefix, K, V, [transient]) ||
-            {K, V} <- Metrics]],
-    zeta:sv_batch(Events),
     Message = [format1(State#state.node_key, M, Timestamp) || M <- Metrics],
     case folsomite_graphite_client_sup:get_client() of
         {ok, Socket} -> folsomite_graphite_client:send(Socket, Message);
         {error, _} = Error -> Error
     end.
-
-prepare_event(Hostname, Prefix, K, V, Tags) ->
-    zeta:ev({Hostname, Prefix ++ " " ++ K}, V, ok, [{tags, [folsomite|Tags]}]).
 
 format1(Base, {K, V}, Timestamp) ->
     ["folsomite.", Base, ".", space2dot(K), " ", a2l(V), " ", Timestamp, "\n"].
