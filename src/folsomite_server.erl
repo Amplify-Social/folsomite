@@ -15,7 +15,7 @@
 -behaviour(gen_server).
 
 %% management api
--export([start_link/0]).
+-export([start_link/0, finalize/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -26,6 +26,7 @@
 -define(TIMER_MSG, '#flush').
 
 -record(state, {flush_interval :: integer(),
+                tags           :: list(atom()),
                 node_key       :: string(),
                 node_prefix    :: string(),
                 timer_ref      :: reference()}).
@@ -35,16 +36,24 @@
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, no_arg, []).
 
+finalize() ->
+    gen_server:call(?MODULE, finalize).
+
 %% gen_server callbacks
 init(no_arg) ->
     process_flag(trap_exit, true),
     FlushInterval = get_env(flush_interval),
+    Tags = [folsomite],
     Ref = erlang:start_timer(FlushInterval, self(), ?TIMER_MSG),
     State = #state{flush_interval = FlushInterval,
+                   tags = Tags,
                    node_key = node_key(),
                    node_prefix = node_prefix(),
                    timer_ref = Ref},
     {ok, State}.
+
+handle_call(finalize, _, State) ->
+    {reply, ok, State};
 
 handle_call(Call, _, State) ->
     unexpected(call, Call),
@@ -66,8 +75,13 @@ handle_info(Info, State) ->
     unexpected(info, Info),
     {noreply, State}.
 
-terminate(shutdown, #state{timer_ref = Ref}) ->
-    erlang:cancel_timer(Ref);
+terminate(shutdown, _State) ->
+    case application:get_env(finalize_on_shutdown) of
+        {ok, true} ->
+            ok;
+        _ ->
+            ok
+    end;
 
 terminate(_, _) -> ok.
 
@@ -82,19 +96,27 @@ get_stats() ->
     Memory ++ Stats ++ lists:flatmap(fun expand_metric/1, Metrics).
 
 
-expand_metric({Name, [{type, Type}]}) ->
-    M = case Type of
+%% @doc Returns `[]' for unknown (skipped) metricts.
+-spec expand_metric({Name, Opts}) -> [Metric] when
+    Metric :: {K::string(), V::string()},
+    Name :: term(),
+    Opts :: [proplists:property()].
+expand_metric({Name, Opts}) ->
+    case proplists:get_value(type, Opts) of
+            undefined -> [];
             histogram ->
-                proplists:delete(histogram,
-                                 folsom_metrics:get_histogram_statistics(Name));
-            Type1 ->
-                case lists:member(Type1,
-                                  [counter, gauge, meter, meter_reader]) of
-                    true -> folsom_metrics:get_metric_value(Name);
+                Stats = folsom_metrics:get_histogram_statistics(Name),
+                M = proplists:delete(histogram, Stats),
+                expand0(M, [Name]);
+            Type ->
+                case lists:member(Type,
+                                  [counter, gauge, meter, spiral, meter_reader, duration]) of
+                    true ->
+                        M = folsom_metrics:get_metric_value(Name),
+                        expand0(M, [Name]);
                     false -> []
                 end
-        end,
-    expand0(M, [Name]);
+        end;
 expand_metric(_) ->
     [].
 
@@ -105,7 +127,7 @@ expand({K, X}, NamePrefix) ->
 expand([_|_] = Xs, NamePrefix) ->
     [expand(X, NamePrefix) || X <- Xs];
 expand(X, NamePrefix) ->
-    K = string:join(lists:map(fun a2l/1, lists:reverse(NamePrefix)), " "),
+    K = string:join(lists:map(fun stringify/1, lists:reverse(NamePrefix)), " "),
     [{K, X}].
 
 send_stats(State) ->
@@ -118,7 +140,7 @@ send_stats(State) ->
     end.
 
 format1(Base, {K, V}, Timestamp) ->
-    ["folsomite.", Base, ".", space2dot(K), " ", a2l(V), " ", Timestamp, "\n"].
+    ["folsomite.", Base, ".", space2dot(K), " ", stringify(V), " ", Timestamp, "\n"].
 
 num2str(NN) -> lists:flatten(io_lib:format("~w",[NN])).
 unixtime()  -> {Meg, S, _} = os:timestamp(), Meg*1000000 + S.
@@ -135,17 +157,27 @@ node_key() ->
     re:replace(NodeList, "[\@\.]", "_", Opts).
 
 
-a2l(X) when is_list(X) -> X;
-a2l(X) when is_atom(X) -> atom_to_list(X);
-a2l(X) when is_integer(X) -> integer_to_list(X);
-a2l(X) when is_float(X) -> float_to_list(X);
-a2l(X) when is_tuple(X) -> string:join([a2l(A) || A <- tuple_to_list(X)], " ").
+stringify(X) when is_list(X) -> X;
+stringify(X) when is_atom(X) -> atom_to_list(X);
+stringify(X) when is_integer(X) -> integer_to_list(X);
+stringify(X) when is_float(X) -> float_to_list(X);
+stringify(X) when is_binary(X) -> binary_to_list(X);
+stringify(X) when is_tuple(X) ->
+    string:join([stringify(A) || A <- tuple_to_list(X)], " ").
 
 space2dot(X) -> string:join(string:tokens(X, " "), ".").
 
 get_env(Name) ->
-    {ok, Value} = application:get_env(?APP, Name),
-    Value.
+    get_env(Name, undefined).
+
+get_env(Name, Default) ->
+    case application:get_env(?APP, Name) of
+        {ok, Value} ->
+            Value;
+        undefined ->
+            Default
+    end.
 
 unexpected(Type, Message) ->
     error_logger:info_msg(" unexpected ~p ~p~n", [Type, Message]).
+
